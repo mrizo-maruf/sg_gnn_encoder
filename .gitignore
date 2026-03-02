@@ -1,8 +1,8 @@
 *.json
 /.venv
-/__pycache__
+__pycache__/
 *.pt
 */pyc
 *.pyc
-run/
+runs/
 sweep*/
