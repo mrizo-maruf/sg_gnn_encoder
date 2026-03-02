@@ -177,28 +177,23 @@ def plot_embedding_pca(
     pca = PCA(n_components=n_components)
     emb_2d = pca.fit_transform(embeddings)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    scatter = ax.scatter(
-        emb_2d[:, 0],
-        emb_2d[:, 1] if n_components >= 2 else np.zeros(len(emb_2d)),
-        c=range(len(scene_ids)),
-        cmap="tab20",
-        s=80,
-        edgecolors="black",
-        linewidth=0.5,
-        alpha=0.8,
-    )
+    fig, ax = plt.subplots(figsize=(12, 8))
+    cmap = plt.cm.get_cmap("tab20", len(scene_ids))
+    colors = [cmap(i) for i in range(len(scene_ids))]
 
-    # Annotate with scene IDs
+    # Plot each scene as a separate scatter entry so it appears in the legend
     for i, sid in enumerate(scene_ids):
         label = sid if len(str(sid)) < 25 else str(sid)[:22] + "..."
-        ax.annotate(
-            label,
-            (emb_2d[i, 0], emb_2d[i, 1] if n_components >= 2 else 0),
-            fontsize=7,
-            alpha=0.75,
-            xytext=(5, 5),
-            textcoords="offset points",
+        y_val = emb_2d[i, 1] if n_components >= 2 else 0
+        ax.scatter(
+            emb_2d[i, 0],
+            y_val,
+            c=[colors[i]],
+            s=80,
+            edgecolors="black",
+            linewidth=0.5,
+            alpha=0.8,
+            label=label,
         )
 
     explained = pca.explained_variance_ratio_ * 100
@@ -207,6 +202,23 @@ def plot_embedding_pca(
         ax.set_ylabel(f"PC2 ({explained[1]:.1f}% var)")
     ax.set_title("Scene Embeddings — PCA Projection (32D → 2D)")
     ax.grid(True, alpha=0.3)
+
+    # Legend — shrink plot to make room, cap entries to avoid overflow
+    if len(scene_ids) <= 40:
+        ax.legend(
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            fontsize=7,
+            framealpha=0.9,
+            title="Scene ID",
+            title_fontsize=8,
+        )
+    else:
+        # Too many scenes — show colorbar instead
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, len(scene_ids) - 1))
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+        cbar.set_label("Scene index")
 
     plt.tight_layout()
     save_path = str(plots_dir / filename)

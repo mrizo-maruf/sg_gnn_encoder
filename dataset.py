@@ -22,6 +22,10 @@ NODE_FEAT_DIM = 10
 # Edge feature dimension: relation_vector(6) + delta_center(3) + dist(1) + extent_ratio(3) = 13
 EDGE_FEAT_DIM = 13
 
+# Simple feature dimensions (center + extent only, relation one-hot only)
+SIMPLE_NODE_FEAT_DIM = 6   # center(3) + extent(3)
+SIMPLE_EDGE_FEAT_DIM = 6   # relation_onehot(6)
+
 # Small epsilon for safe log / division
 EPS = 1e-8
 
@@ -101,6 +105,26 @@ def build_edge_features(
     return torch.cat([relation_t, delta_center, dist, extent_ratio])
 
 
+def build_simple_node_features(center: List[float], extent: List[float]) -> torch.Tensor:
+    """
+    Construct a 6-dim node feature vector (simplified).
+
+    Features: [center(3), extent(3)]
+    """
+    center_t = torch.tensor(center, dtype=torch.float32)
+    extent_t = torch.tensor(extent, dtype=torch.float32)
+    return torch.cat([center_t, extent_t])
+
+
+def build_simple_edge_features(relation_vector: List[float]) -> torch.Tensor:
+    """
+    Construct a 6-dim edge feature vector (simplified).
+
+    Features: [relation_onehot(6)]
+    """
+    return torch.tensor(relation_vector, dtype=torch.float32)
+
+
 def parse_scene_graph(edges_list: list, scene_id: str) -> Data:
     """
     Parse a list of edge dicts into a PyG Data object.
@@ -173,6 +197,68 @@ def parse_scene_graph(edges_list: list, scene_id: str) -> Data:
     return data
 
 
+def parse_scene_graph_simple(edges_list: list, scene_id: str) -> Data:
+    """
+    Parse a list of edge dicts into a PyG Data object with simplified features.
+
+    Node features: center(3) + extent(3) = 6
+    Edge features: relation_onehot(6)
+
+    Args:
+        edges_list: List of edge dictionaries from JSON.
+        scene_id: Identifier string for the scene.
+
+    Returns:
+        torch_geometric.data.Data with x [N,6], edge_index, edge_attr [E,6].
+    """
+    if not edges_list:
+        raise ValueError(f"Empty edge list for scene {scene_id}")
+
+    # --- Collect unique nodes ---
+    node_info = {}
+    for edge in edges_list:
+        src = edge["source"]
+        tgt = edge["target"]
+        sid = src["source_id"]
+        tid = tgt["target_id"]
+        if sid not in node_info:
+            node_info[sid] = (src["source_center"], src["source_extent"])
+        if tid not in node_info:
+            node_info[tid] = (tgt["target_center"], tgt["target_extent"])
+
+    sorted_node_ids = sorted(node_info.keys(), key=lambda x: (isinstance(x, str), x))
+    node_id_to_idx = {nid: i for i, nid in enumerate(sorted_node_ids)}
+    num_nodes = len(sorted_node_ids)
+
+    # --- Build simple node features [N, 6] ---
+    node_features = []
+    for nid in sorted_node_ids:
+        center, extent = node_info[nid]
+        node_features.append(build_simple_node_features(center, extent))
+    x = torch.stack(node_features)
+
+    # --- Build edges with simple features [E, 6] ---
+    src_indices = []
+    tgt_indices = []
+    edge_attrs = []
+    for edge in edges_list:
+        src = edge["source"]
+        tgt = edge["target"]
+        sid = src["source_id"]
+        tid = tgt["target_id"]
+        src_indices.append(node_id_to_idx[sid])
+        tgt_indices.append(node_id_to_idx[tid])
+        edge_attrs.append(build_simple_edge_features(edge["relation_vector"]))
+
+    edge_index = torch.tensor([src_indices, tgt_indices], dtype=torch.long)
+    edge_attr = torch.stack(edge_attrs)
+
+    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+    data.scene_id = scene_id
+    data.num_nodes = num_nodes
+    return data
+
+
 class SceneGraphDataset(Dataset):
     """
     PyTorch Dataset that loads scene graph JSON files from a directory.
@@ -199,6 +285,38 @@ class SceneGraphDataset(Dataset):
                 with open(jp, "r") as f:
                     edges = json.load(f)
                 graph = parse_scene_graph(edges, scene_id=jp.stem)
+                self.graphs.append(graph)
+            except Exception as e:
+                warnings.warn(f"Skipping broken JSON {jp.name}: {e}")
+
+        if len(self.graphs) == 0:
+            warnings.warn(f"No valid graphs loaded from {data_dir}")
+
+    def __len__(self) -> int:
+        return len(self.graphs)
+
+    def __getitem__(self, idx: int) -> Data:
+        return self.graphs[idx]
+
+
+class SimpleSceneGraphDataset(Dataset):
+    """
+    Dataset with simplified features: node=[center,extent](6), edge=[relation_onehot](6).
+    """
+
+    def __init__(self, data_dir: str, json_paths: Optional[List[Path]] = None):
+        super().__init__()
+        if json_paths is not None:
+            self.json_paths = sorted(json_paths)
+        else:
+            self.json_paths = load_all_json_paths(data_dir)
+
+        self.graphs: List[Data] = []
+        for jp in self.json_paths:
+            try:
+                with open(jp, "r") as f:
+                    edges = json.load(f)
+                graph = parse_scene_graph_simple(edges, scene_id=jp.stem)
                 self.graphs.append(graph)
             except Exception as e:
                 warnings.warn(f"Skipping broken JSON {jp.name}: {e}")

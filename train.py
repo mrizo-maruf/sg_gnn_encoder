@@ -34,9 +34,17 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 
 from augment import augment_graph
-from dataset import SceneGraphDataset, load_all_json_paths, NODE_FEAT_DIM, EDGE_FEAT_DIM
+from dataset import (
+    SceneGraphDataset,
+    SimpleSceneGraphDataset,
+    load_all_json_paths,
+    NODE_FEAT_DIM,
+    EDGE_FEAT_DIM,
+    SIMPLE_NODE_FEAT_DIM,
+    SIMPLE_EDGE_FEAT_DIM,
+)
 from losses import CombinedLoss
-from model import SceneGraphEncoder
+from model import SceneGraphEncoder, SceneGraphEncoderLight, SceneGraphEncoderSimple, SceneGraphEncoderSimple3Layer
 from visualize import plot_loss_curves, plot_overfitting_gap, plot_embedding_pca
 
 
@@ -306,9 +314,11 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.1, help="InfoNCE temperature")
     parser.add_argument("--lambda_rel", type=float, default=0.5, help="Relation loss weight")
     parser.add_argument("--no_relation_loss", action="store_true", help="Disable relation prediction loss")
-    parser.add_argument("--hidden_dim", type=int, default=128, help="GATv2 hidden dimension")
+    parser.add_argument("--model", type=str, default="3layer", choices=["3layer", "2layer", "simple", "simple3layer"],
+                        help="Model architecture: '3layer' | '2layer' | 'simple' (2-layer 6-dim) | 'simple3layer' (3-layer 6-dim)")
+    parser.add_argument("--hidden_dim", type=int, default=40, help="GATv2 hidden dimension")
     parser.add_argument("--output_dim", type=int, default=32, help="Scene embedding dimension")
-    parser.add_argument("--dropout", type=float, default=0.15, help="Dropout probability")
+    parser.add_argument("--dropout", type=float, default=0.3, help="Dropout probability")
     parser.add_argument("--patience", type=int, default=30, help="Early stopping patience")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--train_ratio", type=float, default=0.8, help="Train split ratio")
@@ -359,21 +369,35 @@ def main():
         train_paths = val_paths.copy()
         warnings.warn("Train set empty — using val set for training")
 
-    train_dataset = SceneGraphDataset(args.data_dir, json_paths=train_paths)
-    val_dataset = SceneGraphDataset(args.data_dir, json_paths=val_paths)
+    DatasetClass = SimpleSceneGraphDataset if args.model in ("simple", "simple3layer") else SceneGraphDataset
+    train_dataset = DatasetClass(args.data_dir, json_paths=train_paths)
+    val_dataset = DatasetClass(args.data_dir, json_paths=val_paths)
     # Full dataset for embedding visualization
-    full_dataset = SceneGraphDataset(args.data_dir)
+    full_dataset = DatasetClass(args.data_dir)
 
     print(f"[data] Train: {len(train_dataset)} graphs, Val: {len(val_dataset)} graphs")
 
     # ---- Build model ----
-    model = SceneGraphEncoder(
-        node_feat_dim=NODE_FEAT_DIM,
-        edge_feat_dim=EDGE_FEAT_DIM,
+    if args.model == "simple":
+        ModelClass = SceneGraphEncoderSimple
+        nfd, efd = SIMPLE_NODE_FEAT_DIM, SIMPLE_EDGE_FEAT_DIM
+    elif args.model == "simple3layer":
+        ModelClass = SceneGraphEncoderSimple3Layer
+        nfd, efd = SIMPLE_NODE_FEAT_DIM, SIMPLE_EDGE_FEAT_DIM
+    elif args.model == "2layer":
+        ModelClass = SceneGraphEncoderLight
+        nfd, efd = NODE_FEAT_DIM, EDGE_FEAT_DIM
+    else:
+        ModelClass = SceneGraphEncoder
+        nfd, efd = NODE_FEAT_DIM, EDGE_FEAT_DIM
+    model = ModelClass(
+        node_feat_dim=nfd,
+        edge_feat_dim=efd,
         hidden_dim=args.hidden_dim,
         output_dim=args.output_dim,
         dropout=args.dropout,
     ).to(device)
+    print(f"[model] Architecture: {args.model} ({ModelClass.__name__})")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -515,6 +539,13 @@ def main():
 
     # Load best model for embedding visualization
     ckpt = torch.load(run_dir / "best_checkpoint.pt", map_location=device, weights_only=False)
+    model = ModelClass(
+        node_feat_dim=nfd,
+        edge_feat_dim=efd,
+        hidden_dim=args.hidden_dim,
+        output_dim=args.output_dim,
+        dropout=args.dropout,
+    ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     plot_embedding_pca(model, full_dataset, str(run_dir), device)
 

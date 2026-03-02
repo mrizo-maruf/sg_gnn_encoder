@@ -17,7 +17,7 @@ from torch_geometric.nn import GATv2Conv
 from torch_geometric.nn.aggr import AttentionalAggregation
 from torch_geometric.data import Data, Batch
 
-from dataset import NODE_FEAT_DIM, EDGE_FEAT_DIM
+from dataset import NODE_FEAT_DIM, EDGE_FEAT_DIM, SIMPLE_NODE_FEAT_DIM, SIMPLE_EDGE_FEAT_DIM
 
 
 class SceneGraphEncoder(nn.Module):
@@ -62,44 +62,47 @@ class SceneGraphEncoder(nn.Module):
         )
 
         # ---- 3. GATv2 layers ----
-        # Layer 1: in=128, out=64, heads=4, concat=True -> 256
+        head_dim = hidden_dim // 2  # per-head output dimension
+        intermediate_dim = head_dim * 4  # after concat of 4 heads
+
+        # Layer 1: in=hidden_dim, out=head_dim, heads=4, concat -> head_dim*4
         self.gat1 = GATv2Conv(
             in_channels=hidden_dim,
-            out_channels=64,
+            out_channels=head_dim,
             heads=4,
             concat=True,
             edge_dim=edge_feat_dim,
             dropout=dropout,
         )
-        self.norm1 = nn.LayerNorm(64 * 4)  # 256
+        self.norm1 = nn.LayerNorm(intermediate_dim)
 
-        # Layer 2: in=256, out=64, heads=4, concat=True -> 256
+        # Layer 2: in=intermediate_dim, out=head_dim, heads=4, concat -> intermediate_dim
         self.gat2 = GATv2Conv(
-            in_channels=64 * 4,
-            out_channels=64,
+            in_channels=intermediate_dim,
+            out_channels=head_dim,
             heads=4,
             concat=True,
             edge_dim=edge_feat_dim,
             dropout=dropout,
         )
-        self.norm2 = nn.LayerNorm(64 * 4)  # 256
+        self.norm2 = nn.LayerNorm(intermediate_dim)
 
-        # Residual projection for skip connection (128 -> 256)
-        self.res_proj = nn.Linear(hidden_dim, 64 * 4)
+        # Residual projection for skip connection (hidden_dim -> intermediate_dim)
+        self.res_proj = nn.Linear(hidden_dim, intermediate_dim)
 
-        # Layer 3: in=256, out=64, heads=2, concat=True -> 128
+        # Layer 3: in=intermediate_dim, out=head_dim, heads=2, concat -> hidden_dim
         self.gat3 = GATv2Conv(
-            in_channels=64 * 4,
-            out_channels=64,
+            in_channels=intermediate_dim,
+            out_channels=head_dim,
             heads=2,
             concat=True,
             edge_dim=edge_feat_dim,
             dropout=dropout,
         )
-        self.norm3 = nn.LayerNorm(64 * 2)  # 128
+        self.norm3 = nn.LayerNorm(hidden_dim)
 
-        # Residual projection for skip connection (256 -> 128)
-        self.res_proj2 = nn.Linear(64 * 4, 64 * 2)
+        # Residual projection for skip connection (intermediate_dim -> hidden_dim)
+        self.res_proj2 = nn.Linear(intermediate_dim, hidden_dim)
 
         # ---- 4. Attention pooling ----
         gate_nn = nn.Sequential(
@@ -205,6 +208,470 @@ class SceneGraphEncoder(nn.Module):
         Returns:
             Scene embedding tensor [1, 32].
         """
+        batch = (
+            data.batch
+            if hasattr(data, "batch") and data.batch is not None
+            else torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
+        )
+        result = self.forward(data.x, data.edge_index, data.edge_attr, batch)
+        return result["embedding"]
+
+
+class SceneGraphEncoderLight(nn.Module):
+    """
+    Lighter GATv2-based encoder with only 2 GATv2 layers.
+
+    Architecture:
+      1. Node encoder MLP:  node_feat_dim → 128 → hidden_dim
+      2. 2x GATv2Conv layers with edge conditioning + 1 residual connection
+      3. Attention-based graph pooling → graph-level vector
+      4. Scene encoder MLP:  hidden_dim → 64 → output_dim
+
+    Fewer parameters and faster training — better suited for small datasets.
+    """
+
+    def __init__(
+        self,
+        node_feat_dim: int = NODE_FEAT_DIM,
+        edge_feat_dim: int = EDGE_FEAT_DIM,
+        hidden_dim: int = 64,
+        output_dim: int = 32,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.dropout = dropout
+
+        # ---- 1. Node encoder MLP ----
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_feat_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, hidden_dim),
+        )
+
+        # ---- 2. Edge encoder (for relation loss) ----
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_feat_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, hidden_dim),
+        )
+
+        # ---- 3. GATv2 layers (2 layers) ----
+        head_dim = hidden_dim // 2
+        intermediate_dim = head_dim * 4  # after concat of 4 heads
+
+        # Layer 1: hidden_dim → head_dim × 4 heads → intermediate_dim
+        self.gat1 = GATv2Conv(
+            in_channels=hidden_dim,
+            out_channels=head_dim,
+            heads=4,
+            concat=True,
+            edge_dim=edge_feat_dim,
+            dropout=dropout,
+        )
+        self.norm1 = nn.LayerNorm(intermediate_dim)
+
+        # Layer 2: intermediate_dim → head_dim × 2 heads → hidden_dim
+        self.gat2 = GATv2Conv(
+            in_channels=intermediate_dim,
+            out_channels=head_dim,
+            heads=2,
+            concat=True,
+            edge_dim=edge_feat_dim,
+            dropout=dropout,
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+        # Residual projection: hidden_dim → hidden_dim (skip from input)
+        self.res_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # ---- 4. Attention pooling ----
+        gate_nn = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
+        self.pool = AttentionalAggregation(gate_nn=gate_nn)
+
+        # ---- 5. Scene encoder MLP ----
+        self.scene_encoder = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim),
+        )
+
+    def encode_nodes(self, x: torch.Tensor) -> torch.Tensor:
+        return self.node_encoder(x)
+
+    def encode_edges(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        return self.edge_encoder(edge_attr)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        batch: torch.Tensor = None,
+    ) -> dict:
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        # ---- Node encoding ----
+        h = self.encode_nodes(x)  # [N, H]
+        h_skip = h
+
+        # ---- GATv2 Layer 1 ----
+        h = self.gat1(h, edge_index, edge_attr=edge_attr)  # [N, 2H]
+        h = self.norm1(h)
+        h = F.elu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        # ---- GATv2 Layer 2 ----
+        h = self.gat2(h, edge_index, edge_attr=edge_attr)  # [N, H]
+        h = self.norm2(h)
+        h = h + self.res_proj(h_skip)  # residual from input
+        h = F.elu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        node_embeddings = h  # [N, H]
+
+        # ---- Edge representations (for relation loss) ----
+        edge_repr = self.encode_edges(edge_attr)  # [E, H]
+
+        # ---- Attention pooling ----
+        g = self.pool(h, batch)  # [B, H]
+
+        # ---- Scene encoder ----
+        z = self.scene_encoder(g)  # [B, D]
+
+        return {
+            "embedding": z,
+            "node_embeddings": node_embeddings,
+            "edge_repr": edge_repr,
+        }
+
+    def get_scene_embedding(self, data: Data) -> torch.Tensor:
+        batch = (
+            data.batch
+            if hasattr(data, "batch") and data.batch is not None
+            else torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
+        )
+        result = self.forward(data.x, data.edge_index, data.edge_attr, batch)
+        return result["embedding"]
+
+
+class SceneGraphEncoderSimple3Layer(nn.Module):
+    """
+    3-layer GATv2 encoder with simplified 6-dim features.
+
+    Input features:
+      - Node: center(3) + extent(3) = 6
+      - Edge: relation_onehot(6)
+
+    Architecture:
+      1. Node encoder MLP:  6 → 64 → hidden_dim
+      2. Edge encoder MLP:  6 → 32 → hidden_dim  (for relation loss)
+      3. 3x GATv2Conv with edge conditioning + residual connections
+      4. Attention pooling → graph vector
+      5. Scene encoder MLP: hidden_dim → 64 → output_dim
+    """
+
+    def __init__(
+        self,
+        node_feat_dim: int = SIMPLE_NODE_FEAT_DIM,
+        edge_feat_dim: int = SIMPLE_EDGE_FEAT_DIM,
+        hidden_dim: int = 64,
+        output_dim: int = 32,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.dropout = dropout
+
+        # ---- 1. Node encoder MLP ----
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_feat_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, hidden_dim),
+        )
+
+        # ---- 2. Edge encoder (for relation loss) ----
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_feat_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, hidden_dim),
+        )
+
+        # ---- 3. GATv2 layers (3 layers) ----
+        head_dim = hidden_dim // 2
+        intermediate_dim = head_dim * 4  # after concat of 4 heads
+
+        # Layer 1: hidden_dim → head_dim × 4 heads → intermediate_dim
+        self.gat1 = GATv2Conv(
+            in_channels=hidden_dim,
+            out_channels=head_dim,
+            heads=4,
+            concat=True,
+            edge_dim=edge_feat_dim,
+            dropout=dropout,
+        )
+        self.norm1 = nn.LayerNorm(intermediate_dim)
+
+        # Layer 2: intermediate_dim → head_dim × 4 heads → intermediate_dim
+        self.gat2 = GATv2Conv(
+            in_channels=intermediate_dim,
+            out_channels=head_dim,
+            heads=4,
+            concat=True,
+            edge_dim=edge_feat_dim,
+            dropout=dropout,
+        )
+        self.norm2 = nn.LayerNorm(intermediate_dim)
+
+        # Residual projection: hidden_dim → intermediate_dim (skip from input)
+        self.res_proj = nn.Linear(hidden_dim, intermediate_dim)
+
+        # Layer 3: intermediate_dim → head_dim × 2 heads → hidden_dim
+        self.gat3 = GATv2Conv(
+            in_channels=intermediate_dim,
+            out_channels=head_dim,
+            heads=2,
+            concat=True,
+            edge_dim=edge_feat_dim,
+            dropout=dropout,
+        )
+        self.norm3 = nn.LayerNorm(hidden_dim)
+
+        # Residual projection: intermediate_dim → hidden_dim
+        self.res_proj2 = nn.Linear(intermediate_dim, hidden_dim)
+
+        # ---- 4. Attention pooling ----
+        gate_nn = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+        self.pool = AttentionalAggregation(gate_nn=gate_nn)
+
+        # ---- 5. Scene encoder MLP ----
+        self.scene_encoder = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim),
+        )
+
+    def encode_nodes(self, x: torch.Tensor) -> torch.Tensor:
+        return self.node_encoder(x)
+
+    def encode_edges(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        return self.edge_encoder(edge_attr)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        batch: torch.Tensor = None,
+    ) -> dict:
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        # ---- Node encoding ----
+        h = self.encode_nodes(x)       # [N, H]
+        h_skip = h
+
+        # ---- GATv2 Layer 1 ----
+        h = self.gat1(h, edge_index, edge_attr=edge_attr)  # [N, 2H]
+        h = self.norm1(h)
+        h = F.elu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        # ---- GATv2 Layer 2 (with residual from layer 1) ----
+        h_res = h
+        h = self.gat2(h, edge_index, edge_attr=edge_attr)  # [N, 2H]
+        h = self.norm2(h)
+        h = h + h_res  # residual (2H == 2H)
+        h = F.elu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        # Add residual from input (H → 2H via projection)
+        h = h + self.res_proj(h_skip)
+
+        # ---- GATv2 Layer 3 ----
+        h_res2 = h  # [N, 2H]
+        h = self.gat3(h, edge_index, edge_attr=edge_attr)  # [N, H]
+        h = self.norm3(h)
+        h = h + self.res_proj2(h_res2)  # residual (2H → H)
+        h = F.elu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        node_embeddings = h
+
+        # ---- Edge representations ----
+        edge_repr = self.encode_edges(edge_attr)
+
+        # ---- Attention pooling ----
+        g = self.pool(h, batch)
+
+        # ---- Scene encoder ----
+        z = self.scene_encoder(g)
+
+        return {
+            "embedding": z,
+            "node_embeddings": node_embeddings,
+            "edge_repr": edge_repr,
+        }
+
+    def get_scene_embedding(self, data: Data) -> torch.Tensor:
+        batch = (
+            data.batch
+            if hasattr(data, "batch") and data.batch is not None
+            else torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
+        )
+        result = self.forward(data.x, data.edge_index, data.edge_attr, batch)
+        return result["embedding"]
+
+
+class SceneGraphEncoderSimple(nn.Module):
+    """
+    Minimal 2-layer GATv2 encoder with simplified features.
+
+    Input features:
+      - Node: center(3) + extent(3) = 6
+      - Edge: relation_onehot(6)
+
+    Architecture:
+      1. Node encoder MLP:  6 → 64 → hidden_dim
+      2. Edge encoder MLP:  6 → 32 → hidden_dim  (for relation loss)
+      3. 2x GATv2Conv with edge conditioning + residual
+      4. Attention pooling → graph vector
+      5. Scene encoder MLP: hidden_dim → 64 → output_dim
+    """
+
+    def __init__(
+        self,
+        node_feat_dim: int = SIMPLE_NODE_FEAT_DIM,
+        edge_feat_dim: int = SIMPLE_EDGE_FEAT_DIM,
+        hidden_dim: int = 64,
+        output_dim: int = 32,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.dropout = dropout
+
+        # ---- 1. Node encoder MLP ----
+        self.node_encoder = nn.Sequential(
+            nn.Linear(node_feat_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, hidden_dim),
+        )
+
+        # ---- 2. Edge encoder (for relation loss) ----
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_feat_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, hidden_dim),
+        )
+
+        # ---- 3. GATv2 layers (2 layers) ----
+        head_dim = hidden_dim // 2
+        intermediate_dim = head_dim * 4  # after concat of 4 heads
+
+        # Layer 1: hidden_dim → head_dim × 4 heads → intermediate_dim
+        self.gat1 = GATv2Conv(
+            in_channels=hidden_dim,
+            out_channels=head_dim,
+            heads=4,
+            concat=True,
+            edge_dim=edge_feat_dim,
+            dropout=dropout,
+        )
+        self.norm1 = nn.LayerNorm(intermediate_dim)
+
+        # Layer 2: intermediate_dim → head_dim × 2 heads → hidden_dim
+        self.gat2 = GATv2Conv(
+            in_channels=intermediate_dim,
+            out_channels=head_dim,
+            heads=2,
+            concat=True,
+            edge_dim=edge_feat_dim,
+            dropout=dropout,
+        )
+        self.norm2 = nn.LayerNorm(hidden_dim)
+
+        # Residual projection: hidden_dim → hidden_dim
+        self.res_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # ---- 4. Attention pooling ----
+        gate_nn = nn.Sequential(
+            nn.Linear(hidden_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+        self.pool = AttentionalAggregation(gate_nn=gate_nn)
+
+        # ---- 5. Scene encoder MLP ----
+        self.scene_encoder = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim),
+        )
+
+    def encode_nodes(self, x: torch.Tensor) -> torch.Tensor:
+        return self.node_encoder(x)
+
+    def encode_edges(self, edge_attr: torch.Tensor) -> torch.Tensor:
+        return self.edge_encoder(edge_attr)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor,
+        batch: torch.Tensor = None,
+    ) -> dict:
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        # ---- Node encoding ----
+        h = self.encode_nodes(x)       # [N, H]
+        h_skip = h
+
+        # ---- GATv2 Layer 1 ----
+        h = self.gat1(h, edge_index, edge_attr=edge_attr)  # [N, 2H]
+        h = self.norm1(h)
+        h = F.elu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        # ---- GATv2 Layer 2 ----
+        h = self.gat2(h, edge_index, edge_attr=edge_attr)  # [N, H]
+        h = self.norm2(h)
+        h = h + self.res_proj(h_skip)  # residual from input
+        h = F.elu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+
+        node_embeddings = h
+
+        # ---- Edge representations ----
+        edge_repr = self.encode_edges(edge_attr)
+
+        # ---- Attention pooling ----
+        g = self.pool(h, batch)
+
+        # ---- Scene encoder ----
+        z = self.scene_encoder(g)
+
+        return {
+            "embedding": z,
+            "node_embeddings": node_embeddings,
+            "edge_repr": edge_repr,
+        }
+
+    def get_scene_embedding(self, data: Data) -> torch.Tensor:
         batch = (
             data.batch
             if hasattr(data, "batch") and data.batch is not None
